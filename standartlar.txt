@@ -1,0 +1,388 @@
+==============================================================
+APPSEC PROJE STANDARTLARI
+==============================================================
+
+Banka iç AppSec pipeline'ı her GitHub push'unda otomatik koşar.
+Bu standartlara uyan projeler temiz tarama alır.
+Uymayan projeler ya bazı kontrolleri atlar ya da false positive
+gürültüsü üretir.
+
+Bu dosyayı AI asistanına (Cursor, Copilot, Claude) instruction
+olarak ver. AI projeyi bu kurallara göre oluşturacak.
+
+
+--------------------------------------------------------------
+1) HER REPODA OLMASI GEREKEN DOSYALAR
+--------------------------------------------------------------
+
+REPO KÖKÜNDE (zorunlu):
+
+  .appsec.yml                        → AppSec manifest (aşağıda)
+  .github/workflows/security.yml     → caller workflow (AppSec verir)
+  Dockerfile                         → tek tane, root'ta, bu adla
+  README.md                          → 1 satır "nasıl çalıştırılır"
+  .gitignore                         → yasak dizinleri içermeli
+
+REPO KÖKÜNDE (dile göre, sonraki bölüm):
+
+  Manifest dosyası + lockfile
+
+
+--------------------------------------------------------------
+2) .APPSEC.YML — STANDART İÇERİK
+--------------------------------------------------------------
+
+Her proje kökünde bu dosya olmalı:
+
+  language: python          # python | nodejs | go | java | dotnet
+  port: 5000                # uygulamanın dinlediği port
+  health_endpoint: /        # 200 OK dönen endpoint
+  dast: true                # active DAST taraması yapılsın mı
+
+Port mantığı:
+  python   genelde 5000 veya 8000
+  nodejs   genelde 3000
+  go       genelde 8080
+  java     genelde 8080
+  dotnet   genelde 8080 veya 5000
+
+
+--------------------------------------------------------------
+3) DOSYA ADLARI — DILE GÖRE
+--------------------------------------------------------------
+
+PYTHON
+  ZORUNLU:    requirements.txt
+              (req.txt DEĞIL, deps.txt DEĞIL, sadece requirements.txt)
+
+              İçi pinli sürüm olmalı, ÖRN:
+                  Flask==2.3.3
+                  requests==2.31.0
+
+  ALTERNATIF: pyproject.toml + uv.lock
+              veya pyproject.toml + poetry.lock
+              (sadece pyproject.toml YETMEZ, lockfile şart)
+
+  ÖNERILMEZ:  setup.py tek başına (lockfile yok)
+
+
+NODE.JS
+  ZORUNLU:    package.json
+  ZORUNLU:    package-lock.json
+              (yarn.lock veya pnpm-lock.yaml de olur, bunlardan biri olmalı)
+
+              package.json'da "dependencies" altında sürümler
+              kesin yazılmalı, "^" veya "*" değil.
+
+
+GO
+  ZORUNLU:    go.mod
+  ZORUNLU:    go.sum
+
+
+JAVA
+  Maven ise:   pom.xml      (versiyonlar pinli, "LATEST" YASAK)
+  Gradle ise:  build.gradle veya build.gradle.kts
+               + gradle.lockfile  (lockfile aktive edilmeli)
+
+
+.NET (C#)
+  ZORUNLU:    *.csproj (örn: MyApp.csproj)
+  ZORUNLU:    packages.lock.json
+
+              csproj içine şu satırı eklemelisin:
+                <PropertyGroup>
+                  <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+                </PropertyGroup>
+
+              Sonra `dotnet restore --use-lock-file` çalıştırınca
+              packages.lock.json oluşur. Bu dosya commit edilmeli.
+
+  Multi-project (.sln) ise her csproj için ayrı lockfile gerekir.
+
+
+--------------------------------------------------------------
+4) DOCKERFILE KURALLARI
+--------------------------------------------------------------
+
+ZORUNLU:
+  - Adı tam olarak "Dockerfile" olacak (Dockerfile.dev YASAK)
+  - Repo kökünde olacak (alt dizinde DEĞIL)
+  - Tek tane Dockerfile olacak
+
+İÇERİĞINDE OLMASI GEREKENLER:
+
+  FROM <stable image>          # alpine/slim variant tercih edilir
+  WORKDIR /app
+  COPY <deps manifest>         # önce manifest, cache'i kullan
+  RUN <install>
+  COPY . .
+  EXPOSE <port>                # .appsec.yml'deki port ile aynı
+  USER <numeric uid or name>   # root DEĞIL, mesela "USER 1001"
+  CMD ["binary", "arg"]        # interactive shell DEĞIL
+
+ÖRNEK (Python):
+
+  FROM python:3.12-slim
+  WORKDIR /app
+  COPY requirements.txt .
+  RUN pip install --no-cache-dir -r requirements.txt
+  COPY . .
+  EXPOSE 5000
+  USER 1001
+  CMD ["python", "app.py"]
+
+
+--------------------------------------------------------------
+5) UYGULAMA KODU KURALLARI
+--------------------------------------------------------------
+
+5.1) APP MUTLAKA 0.0.0.0'a BIND ETMELI
+
+     127.0.0.1 veya localhost YASAK — DAST taraması erişemez.
+
+     Python:   app.run(host="0.0.0.0", port=5000)
+     Node.js:  app.listen(3000, "0.0.0.0")
+     Go:       http.ListenAndServe("0.0.0.0:8080", nil)
+     .NET:     builder.WebHost.UseUrls("http://0.0.0.0:8080");
+     Java:     server.port=0.0.0.0:8080 (application.properties)
+
+
+5.2) HEALTH ENDPOINT
+
+     GET / veya GET /health 200 OK dönmeli.
+     DAST hazırlık probe'u burayı çağırır.
+
+
+5.3) SECRET'I HARDCODE ETME
+
+     ❌ YASAK:   const key = "sk_live_xxx";
+     ✅ DOĞRU:  const key = process.env.STRIPE_KEY;
+
+     Pipeline Gitleaks ile hardcoded secret'leri yakalar.
+     Bulursa verdict RED olur, deploy blok.
+
+
+--------------------------------------------------------------
+6) .GITIGNORE — YASAK DIZIN/DOSYALAR
+--------------------------------------------------------------
+
+Bunları commit ETME, .gitignore'a ekle:
+
+  # Dependencies
+  node_modules/
+  vendor/
+  .venv/
+  venv/
+  __pycache__/
+  *.pyc
+
+  # .NET
+  bin/
+  obj/
+
+  # Java
+  target/
+  *.class
+
+  # Build output
+  dist/
+  build/
+  out/
+
+  # Secrets
+  .env
+  .env.*
+  *.pfx
+  *.key
+  *.pem
+  credentials.json
+  appsettings.Production.json
+
+
+--------------------------------------------------------------
+7) REPO STRUCTURE ÖRNEĞI
+--------------------------------------------------------------
+
+PYTHON projesi:
+
+  my-python-app/
+  ├── .appsec.yml
+  ├── .github/workflows/security.yml
+  ├── .gitignore
+  ├── Dockerfile
+  ├── README.md
+  ├── requirements.txt
+  └── app.py
+
+NODE.JS projesi:
+
+  my-node-app/
+  ├── .appsec.yml
+  ├── .github/workflows/security.yml
+  ├── .gitignore
+  ├── Dockerfile
+  ├── README.md
+  ├── package.json
+  ├── package-lock.json
+  └── server.js
+
+GO projesi:
+
+  my-go-app/
+  ├── .appsec.yml
+  ├── .github/workflows/security.yml
+  ├── .gitignore
+  ├── Dockerfile
+  ├── README.md
+  ├── go.mod
+  ├── go.sum
+  └── main.go
+
+.NET projesi:
+
+  my-dotnet-app/
+  ├── .appsec.yml
+  ├── .github/workflows/security.yml
+  ├── .gitignore
+  ├── Dockerfile
+  ├── README.md
+  ├── MyApp.csproj
+  ├── packages.lock.json
+  └── Program.cs
+
+
+--------------------------------------------------------------
+8) PIPELINE NE YAPAR (BILGI)
+--------------------------------------------------------------
+
+Her push'ta otomatik koşan job'lar:
+
+  1. Preflight     → .appsec.yml + dosya yapısını okur
+  2. Secret scan   → Gitleaks (hardcoded credential'lar)
+  3. SAST          → Semgrep (kod zafiyetleri: SQLi, XSS, cmd inj)
+  4. SCA           → Trivy (dependency CVE'leri)
+  5. Container     → Trivy (Docker image CVE'leri)
+  6. DAST          → ZAP active scan (~5-8 dk) +
+                     Nuclei template scan (CVE + misconfig + exposure)
+                     (rate-limit: 50 req/sn, app'i yormaz)
+  7. Verdict       → GREEN / YELLOW / RED kararı
+
+VERDICT MANTIĞI (BANKING SIFIR TOLERANS):
+
+  RED     → CRITICAL bulgu veya hardcoded secret var.
+            Deploy YASAK. Tümünü kapat.
+
+  YELLOW  → HIGH bulgu var (hangi tarama olursa olsun: SAST, SCA,
+            container, DAST, Nuclei). GREEN için tümü kapatılmalı.
+            AppSec onayı olmadan deploy etmeyin.
+
+  GREEN   → Hiçbir CRITICAL, HIGH ve secret yok. Deploy OK.
+
+NOT: Eskiden HIGH için "5 ve altı" GREEN'di. Yeni kural sıfır
+tolerans — tek bir HIGH bile YELLOW yapar. Banking'de bu
+gerekli çünkü 1 SQL injection bile yeterli zarar verir.
+
+EKSIK DURUM:
+
+  Dockerfile yok        → Container scan + DAST SKIP edilir
+  .appsec.yml yok       → Dile göre default'lar uygulanır
+  Lockfile yok (Node)   → Otomatik üretilir (eksik olabilir)
+  App ayağa kalkmazsa  → DAST warning verir, devam eder
+
+
+--------------------------------------------------------------
+9) AI'A ÖZET TALIMAT (kopyala-yapıştır)
+--------------------------------------------------------------
+
+"Her proje oluştururken AŞAĞIDAKILERI MUTLAKA YAP:
+
+ 1. Repo köküne .appsec.yml yaz (language, port, health_endpoint, dast).
+
+ 2. Repo köküne Dockerfile yaz:
+    - EXPOSE <port> (.appsec.yml port ile aynı)
+    - USER <numeric uid, mesela 1001> (root değil)
+    - Interactive shell CMD kullanma
+
+ 3. App'i 0.0.0.0:<port>'a bind et, 127.0.0.1 KULLANMA.
+
+ 4. GET / endpoint'i 200 OK dönsün.
+
+ 5. Dile göre manifest + lockfile commit et:
+    Python  → requirements.txt (pin'li sürümler)
+    Node.js → package.json + package-lock.json
+    Go      → go.mod + go.sum
+    Java    → pom.xml veya build.gradle + gradle.lockfile
+    .NET    → *.csproj + packages.lock.json
+              (RestorePackagesWithLockFile=true olmalı csproj'da)
+
+ 6. Secret HARDCODE ETME. Env variable kullan.
+
+ 7. .gitignore'a ekle: node_modules/, vendor/, .venv/, bin/,
+    obj/, target/, dist/, build/, .env, .env.*
+
+ 8. README.md'ye 'docker build && docker run -p PORT:PORT'
+    komutunu yaz.
+
+ 9. .github/workflows/security.yml dosyasını AppSec ekibinden al,
+    olduğu gibi kullan, DEĞIŞTIRME."
+
+
+--------------------------------------------------------------
+15) MULTI-COMPONENT DAST (frontend + backend, mikroservis)
+--------------------------------------------------------------
+
+Tek bir uygulamadan fazlası varsa (örn. frontend + backend),
+.appsec.yml'a `components:` ekle. Her bileşen için:
+  - name:           kısa isim (backend, frontend, api, worker)
+  - port:           dinlediği port (zorunlu)
+  - start:          nasıl başlatılacağı (zorunlu, shell komutu)
+  - health:         hazır olduğunu gösteren endpoint (default: /)
+  - wait_seconds:   hazır olmasını kaç sn beklemeli (default: 30)
+
+ÖRNEK (1 backend + 1 frontend):
+
+  language: nodejs
+  dast: true
+  components:
+    - name: backend
+      port: 5000
+      start: docker run -d -p 5000:5000 --name backend local/app:test
+      health: /api/health
+      wait_seconds: 30
+    - name: frontend
+      port: 3000
+      start: cd frontend && npm install --silent && npm run dev
+      health: /
+      wait_seconds: 60
+
+ÖRNEK (2 backend + 1 frontend):
+
+  components:
+    - name: backend-api
+      port: 5000
+      start: docker run -d -p 5000:5000 --name api local/api:test
+      health: /health
+    - name: backend-worker
+      port: 5001
+      start: docker run -d -p 5001:5001 --name worker local/worker:test
+      health: /health
+    - name: frontend
+      port: 3000
+      start: cd web && npm install --silent && npm start
+      health: /
+
+NOTLAR:
+  - components yoksa, eski tek-port mantığı (port: + dast:) aynen
+    çalışır. Yani vibecoder bunu yazmasa da problem değil.
+  - components zaten varsa eski port: alanı kullanılmaz.
+  - Pipeline tüm bileşenleri SIRAYLA başlatır (önce backend
+    sonra frontend - frontend backend'e bağımlıysa çalışır).
+  - Her bileşene ayrı ZAP ve Nuclei scan koşar, raporda
+    component bazlı gösterilir.
+
+--------------------------------------------------------------
+SON
+--------------------------------------------------------------
+
+Soru olursa AppSec ekibine.

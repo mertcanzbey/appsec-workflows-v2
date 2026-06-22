@@ -1,0 +1,1212 @@
+name: AppSec Security (Reusable)
+
+# Reusable workflow — sadece push'ta tetiklenir (caller tarafında).
+#
+# ÖNERILEN CALLER (5 satır, .appsec.yml ile auto-config):
+#   on: { push: {} }
+#   permissions: { contents: read, statuses: write, actions: read }
+#   jobs:
+#     appsec:
+#       uses: <ORG>/appsec-workflows/.github/workflows/security-reusable.yml@main
+#
+# Proje kök dizinine .appsec.yml koy (zorunlu değil, varsa pipeline daha akıllı):
+#   language: python      # python | nodejs | go | java
+#   port: 5000            # Dockerfile EXPOSE ile aynı
+#   health_endpoint: /
+#   dast: true            # aktif DAST ister misin (default: false)
+
+on:
+  workflow_call:
+    inputs:
+      # Tüm input'lar OPSİYONEL — .appsec.yml ve auto-detect varsa caller hiçbir şey geçmeyebilir.
+      enable_container_scan:
+        type: boolean
+        default: true
+      enable_dast:
+        description: 'DAST override; boş ise .appsec.yml dast değeri kullanılır'
+        type: string
+        default: ''
+      dast_target:
+        type: string
+        default: ''
+      dast_start_command:
+        type: string
+        default: ''
+      dast_wait_seconds:
+        type: number
+        default: 30
+      critical_threshold:
+        description: 'Bu eşiğin üzerinde CRITICAL = RED. Banking varsayılan: 0 (sıfır tolerans)'
+        type: number
+        default: 0
+      high_threshold:
+        description: 'Bu eşiğin üzerinde HIGH = YELLOW. Banking varsayılan: 0 (sıfır tolerans)'
+        type: number
+        default: 0
+      soft_fail:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  statuses: write   # commit status için
+  actions: read
+
+# Aynı ref'e eşzamanlı push olursa eskisini iptal et, sadece son commit taransın
+concurrency:
+  group: appsec-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # =====================================================================
+  # 0) Pre-flight — proje profilini çıkar (.appsec.yml + file detection)
+  # =====================================================================
+  preflight:
+    name: 🔎 Pre-flight Profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      project_type:      ${{ steps.detect.outputs.project_type }}
+      has_dockerfile:    ${{ steps.detect.outputs.has_dockerfile }}
+      dockerfile_path:   ${{ steps.detect.outputs.dockerfile_path }}
+      dockerfile_dir:    ${{ steps.detect.outputs.dockerfile_dir }}
+      dockerfile_at_root: ${{ steps.detect.outputs.dockerfile_at_root }}
+      has_lockfile:      ${{ steps.detect.outputs.has_lockfile }}
+      has_appsec_yml:    ${{ steps.detect.outputs.has_appsec_yml }}
+      port:              ${{ steps.detect.outputs.port }}
+      health_endpoint:   ${{ steps.detect.outputs.health_endpoint }}
+      dast_enabled:      ${{ steps.detect.outputs.dast_enabled }}
+      dast_target:       ${{ steps.detect.outputs.dast_target }}
+      dast_start_command: ${{ steps.detect.outputs.dast_start_command }}
+      components_json:   ${{ steps.detect.outputs.components_json }}
+      components_count:  ${{ steps.detect.outputs.components_count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: detect
+        run: |
+          set -e
+
+          # ---- Dockerfile tespiti (root-first + recursive fallback) ----
+          DF_PATH=""
+          DF_DIR=""
+          DF=false
+          DF_AT_ROOT=false
+          if [ -f Dockerfile ]; then
+            DF_PATH="Dockerfile"
+            DF_DIR="."
+            DF=true
+            DF_AT_ROOT=true
+            echo "✅ Dockerfile root'ta bulundu"
+          else
+            # Recursive ara — noise dizinleri hariç
+            DF_PATH=$(find . -name Dockerfile \
+              -not -path './node_modules/*' \
+              -not -path './.venv/*' \
+              -not -path './venv/*' \
+              -not -path './vendor/*' \
+              -not -path './.git/*' \
+              -not -path './dist/*' \
+              -not -path './build/*' \
+              -not -path './target/*' \
+              -not -path './bin/*' \
+              -not -path './obj/*' \
+              -not -path './test/*' \
+              -not -path './tests/*' \
+              -not -path './.next/*' \
+              -not -path './.nuxt/*' \
+              2>/dev/null | sort | head -1)
+            if [ -n "$DF_PATH" ]; then
+              DF_PATH="${DF_PATH#./}"
+              DF_DIR=$(dirname "$DF_PATH")
+              DF=true
+              DF_AT_ROOT=false
+              echo "::warning::Dockerfile root'ta değil, $DF_PATH bulundu. Standart: repo kökünde tek Dockerfile (standartlar.txt §3)."
+            else
+              DF_PATH=""
+              DF_DIR=""
+              DF=false
+              echo "::error::Dockerfile bulunamadı (recursive arama: node_modules/.venv/vendor/.git/dist/build/target/bin/obj/test hariç). Container scan + DAST atlanacak. Vibecoder Dockerfile commit etmeli (standartlar.txt §3)."
+            fi
+          fi
+
+          if [ -f package-lock.json ] || [ -f yarn.lock ] || [ -f pnpm-lock.yaml ] || \
+             [ -f poetry.lock ] || [ -f Pipfile.lock ] || [ -f go.sum ]; then
+            LF=true
+          else
+            LF=false
+          fi
+          if [ -f .appsec.yml ]; then AM=true; else AM=false; fi
+
+          # ---- Dil tespiti ----
+          if   [ -f package.json ];        then PT=nodejs
+          elif [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f setup.py ]; then PT=python
+          elif [ -f go.mod ];              then PT=go
+          elif [ -f pom.xml ] || [ -f build.gradle ] || [ -f build.gradle.kts ]; then PT=java
+          else PT=unknown
+          fi
+
+          # ---- Default'lar dile göre ----
+          case "$PT" in
+            nodejs) DEF_PORT=3000 ;;
+            python) DEF_PORT=5000 ;;
+            go)     DEF_PORT=8080 ;;
+            java)   DEF_PORT=8080 ;;
+            *)      DEF_PORT=8080 ;;
+          esac
+
+          # ---- .appsec.yml parse (varsa) ----
+          PORT=$DEF_PORT
+          HEALTH=/
+          DAST=false
+          if [ "$AM" = "true" ]; then
+            # yq indir (retry'lı), .appsec.yml parse et
+            for i in 1 2 3; do
+              if sudo curl -sSL --retry 3 --retry-delay 5 --max-time 60 \
+                  -o /usr/local/bin/yq \
+                  https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64; then break; fi
+              echo "yq retry $i/3..."; sleep $((i * 5))
+            done
+            sudo chmod +x /usr/local/bin/yq || { echo "::warning::yq indir başarısız, default değerler kullanılacak"; AM=false; }
+            if [ "$AM" = "true" ]; then
+              PORT=$(yq -r ".port // $DEF_PORT"          .appsec.yml 2>/dev/null || echo $DEF_PORT)
+              HEALTH=$(yq -r '.health_endpoint // "/"'   .appsec.yml 2>/dev/null || echo "/")
+              DAST=$(yq -r '.dast // false'              .appsec.yml 2>/dev/null || echo false)
+            fi
+          fi
+
+          # ---- Components (multi-component DAST) ----
+          COMPONENTS_JSON='[]'
+          COMPONENTS_COUNT=0
+          if [ "$AM" = "true" ] && yq -e '.components | type == "!!seq"' .appsec.yml > /dev/null 2>&1; then
+            # .appsec.yml'da components: array var
+            COMPONENTS_JSON=$(yq -o=json '.components' .appsec.yml | jq -c '[.[] | {
+              name: (.name // "app"),
+              port: (.port // 8080),
+              start: (.start // ""),
+              health: (.health // "/"),
+              wait_seconds: (.wait_seconds // 30)
+            }]')
+            COMPONENTS_COUNT=$(echo "$COMPONENTS_JSON" | jq 'length')
+
+            # Validation: name+port+start zorunlu, eksikse error
+            MISSING=$(echo "$COMPONENTS_JSON" | jq -r '.[] | select(.name=="" or .port==0 or .start=="") | .name')
+            if [ -n "$MISSING" ]; then
+              echo "::error::components içinde name/port/start eksik bileşen var: $MISSING (standartlar.txt §15)"
+            fi
+            echo "🧩 Multi-component mode: $COMPONENTS_COUNT component bulundu"
+          fi
+
+          # ---- Caller override (input verildiyse onu kullan) ----
+          CALLER_DAST="${{ inputs.enable_dast }}"
+          if [ -n "$CALLER_DAST" ]; then DAST="$CALLER_DAST"; fi
+
+          CALLER_TARGET="${{ inputs.dast_target }}"
+          if [ -n "$CALLER_TARGET" ]; then
+            TARGET="$CALLER_TARGET"
+          else
+            TARGET="http://localhost:${PORT}"
+          fi
+
+          CALLER_CMD='${{ inputs.dast_start_command }}'
+          if [ -n "$CALLER_CMD" ]; then
+            START_CMD="$CALLER_CMD"
+          else
+            # Auto-generate: image build edilecek, sonra port-forward ile çalıştır
+            START_CMD="docker run -d -p ${PORT}:${PORT} --name appsec-scan-target local/app:test"
+          fi
+
+          # ---- Components synthesize (multi yoksa, eski tek-component'i synthesize et) ----
+          if [ "$COMPONENTS_COUNT" -eq 0 ]; then
+            COMPONENTS_JSON=$(jq -nc --arg port "$PORT" --arg start "$START_CMD" --arg health "$HEALTH" \
+              '[{name: "app", port: ($port|tonumber), start: $start, health: $health, wait_seconds: 30}]')
+            COMPONENTS_COUNT=1
+          fi
+
+          # ---- Çıktılar ----
+          {
+            echo "project_type=$PT"
+            echo "has_dockerfile=$DF"
+            echo "dockerfile_path=$DF_PATH"
+            echo "dockerfile_dir=$DF_DIR"
+            echo "dockerfile_at_root=$DF_AT_ROOT"
+            echo "has_lockfile=$LF"
+            echo "has_appsec_yml=$AM"
+            echo "port=$PORT"
+            echo "health_endpoint=$HEALTH"
+            echo "dast_enabled=$DAST"
+            echo "dast_target=$TARGET"
+            echo "dast_start_command=$START_CMD"
+            echo "components_json=$COMPONENTS_JSON"
+            echo "components_count=$COMPONENTS_COUNT"
+          } >> $GITHUB_OUTPUT
+
+          # ---- Summary tablo ----
+          {
+            echo "## 🔎 Pre-flight Profile"
+            echo ""
+            echo "| Özellik | Değer |"
+            echo "|---|---|"
+            echo "| Project type     | \`$PT\` |"
+            echo "| Has Dockerfile   | \`$DF\` |"
+            if [ "$DF" = "true" ]; then
+              echo "| Dockerfile path  | \`$DF_PATH\` |"
+              echo "| Dockerfile @root | \`$DF_AT_ROOT\` |"
+            fi
+            echo "| Has lock file    | \`$LF\` |"
+            echo "| Has .appsec.yml  | \`$AM\` |"
+            echo "| Port             | \`$PORT\` |"
+            echo "| Health endpoint  | \`$HEALTH\` |"
+            echo "| DAST enabled     | \`$DAST\` |"
+            echo "| DAST target      | \`$TARGET\` |"
+            echo "| Components       | \`$COMPONENTS_COUNT\` |"
+            echo ""
+            if [ "$COMPONENTS_COUNT" -gt 1 ]; then
+              echo "**Multi-component DAST:**"
+              echo "| Name | Port | Health | Start |"
+              echo "|---|---|---|---|"
+              echo "$COMPONENTS_JSON" | jq -r '.[] | "| `\(.name)` | `\(.port)` | `\(.health)` | `\(.start | .[0:60])` |"'
+              echo ""
+            fi
+            if [ "$DF" = "false" ]; then
+              echo "❌ **Dockerfile bulunamadı (recursive ile bile)** — Container scan ve DAST atlanacak. Vibecoder Dockerfile commit etmeli."
+            elif [ "$DF_AT_ROOT" = "false" ]; then
+              echo "⚠️  Dockerfile root'ta değil, \`$DF_PATH\` adresinde bulundu. Standart: repo kökünde Dockerfile (standartlar.txt §3). Yine de devam edildi."
+            fi
+            if [ "$LF" = "false" ] && [ "$PT" = "nodejs" ]; then
+              echo "⚠️  package-lock.json yok — SCA için lockfile otomatik üretilecek (kayıp olabilir)."
+            fi
+            if [ "$AM" = "false" ]; then
+              echo "ℹ️  .appsec.yml yok — default değerler kullanıldı. Daha iyi sonuç için ekleyin."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+  # =====================================================================
+  # 1) Secret Scan — Gitleaks
+  # =====================================================================
+  secret-scan:
+    name: 🔐 Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Gitleaks binary
+        id: cache-gitleaks
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/gitleaks
+          key: gitleaks-v8.21.2-linux-x64
+
+      - name: Install Gitleaks (cache miss)
+        if: steps.cache-gitleaks.outputs.cache-hit != 'true'
+        run: |
+          V=8.21.2
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 60 \
+                "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz" \
+                -o /tmp/gitleaks.tar.gz; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          sudo tar xz -C /usr/local/bin -f /tmp/gitleaks.tar.gz gitleaks
+          gitleaks version
+
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format json \
+            --report-path gitleaks.json \
+            --exit-code 0 \
+            --redact \
+            --no-banner || true
+          # Boş dosya yoksa boş array yaz
+          [ -s gitleaks.json ] || echo "[]" > gitleaks.json
+
+      - name: Job Summary
+        run: |
+          COUNT=$(jq 'length' gitleaks.json)
+          echo "## 🔐 Secret Scan (Gitleaks)" >> $GITHUB_STEP_SUMMARY
+          echo "**Bulgu:** $COUNT" >> $GITHUB_STEP_SUMMARY
+          if [ "$COUNT" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Kural | Dosya | Satır |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "| \(.RuleID) | `\(.File)` | \(.StartLine) |"' gitleaks.json | head -30 >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ Secret bulunamadı" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-secrets
+          path: gitleaks.json
+
+  # =====================================================================
+  # 2) SAST — Semgrep
+  # =====================================================================
+  sast:
+    name: 🔍 SAST
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50   # baseline scan için yeterli geçmiş
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip (Semgrep wheel)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-semgrep-${{ runner.os }}-v1
+
+      - name: Cache Semgrep rules + metadata
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.semgrep
+            ~/.cache/semgrep
+          key: semgrep-${{ runner.os }}-v1
+          restore-keys: |
+            semgrep-${{ runner.os }}-
+
+      - name: Install Semgrep
+        run: pip install --quiet semgrep
+
+      - name: Determine baseline (incremental scan when mümkün)
+        id: baseline
+        run: |
+          # main'e push → tam tarama; başka branch'e push → main ile diff
+          if [ "$GITHUB_REF" = "refs/heads/main" ] || [ "$GITHUB_REF" = "refs/heads/master" ]; then
+            echo "mode=full" >> $GITHUB_OUTPUT
+            echo "baseline=" >> $GITHUB_OUTPUT
+            echo "Full scan (main branch)"
+          else
+            git fetch origin main:refs/remotes/origin/main --depth=50 2>/dev/null || \
+              git fetch origin master:refs/remotes/origin/master --depth=50 2>/dev/null || true
+            BASE=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD origin/master 2>/dev/null || echo "")
+            if [ -n "$BASE" ]; then
+              echo "mode=incremental" >> $GITHUB_OUTPUT
+              echo "baseline=$BASE" >> $GITHUB_OUTPUT
+              echo "Incremental scan from $BASE"
+            else
+              echo "mode=full" >> $GITHUB_OUTPUT
+              echo "baseline=" >> $GITHUB_OUTPUT
+              echo "Full scan (no baseline found)"
+            fi
+          fi
+
+      - name: Run Semgrep
+        run: |
+          BASELINE_ARG=""
+          if [ -n "${{ steps.baseline.outputs.baseline }}" ]; then
+            BASELINE_ARG="--baseline-commit ${{ steps.baseline.outputs.baseline }}"
+          fi
+          semgrep scan \
+            --config=p/default \
+            --config=p/security-audit \
+            --config=p/owasp-top-ten \
+            --jobs $(nproc) \
+            --timeout 60 \
+            --max-target-bytes 5000000 \
+            --json --output=semgrep.json \
+            --metrics=off \
+            $BASELINE_ARG || true
+          [ -s semgrep.json ] || echo '{"results":[]}' > semgrep.json
+
+      - name: Job Summary
+        run: |
+          HIGH=$(jq '[.results[] | select(.extra.severity=="ERROR")]   | length' semgrep.json)
+          MED=$( jq '[.results[] | select(.extra.severity=="WARNING")] | length' semgrep.json)
+          LOW=$( jq '[.results[] | select(.extra.severity=="INFO")]    | length' semgrep.json)
+          echo "## 🔍 SAST (Semgrep)" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 High  | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Med   | $MED  |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔵 Low   | $LOW  |" >> $GITHUB_STEP_SUMMARY
+          if [ $((HIGH + MED)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Tüm bulgular (HIGH/MED)" >> $GITHUB_STEP_SUMMARY
+            jq -r '.results[]
+              | select(.extra.severity=="ERROR" or .extra.severity=="WARNING")
+              | "<details><summary>🔴 **\(.extra.severity)** `\(.check_id)` — `\(.path):\(.start.line)`</summary>\n\n> \((.extra.message // "n/a") | gsub("\n"; " "))\n\n</details>\n"' \
+              semgrep.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-sast
+          path: semgrep.json
+
+  # =====================================================================
+  # 3) SCA — Trivy filesystem
+  # =====================================================================
+  sca:
+    name: 📦 SCA
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Trivy binary
+        id: cache-trivy-bin
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/trivy
+          key: trivy-v0.71.0-linux-64bit
+
+      - name: Install Trivy (cache miss)
+        if: steps.cache-trivy-bin.outputs.cache-hit != 'true'
+        run: |
+          V=0.71.0
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 90 \
+                "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
+                -o /tmp/trivy.tar.gz; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          sudo tar xz -C /usr/local/bin -f /tmp/trivy.tar.gz trivy
+          trivy --version
+
+      - name: Cache Trivy vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Generate Node lockfile if missing (so Trivy can scan)
+        run: |
+          for pj in $(find . -name package.json -not -path './node_modules/*' 2>/dev/null); do
+            dir=$(dirname "$pj")
+            if [ ! -f "$dir/package-lock.json" ] && [ ! -f "$dir/yarn.lock" ] && [ ! -f "$dir/pnpm-lock.yaml" ]; then
+              echo "[$dir] lockfile yok, üretiliyor..."
+              (cd "$dir" && npm install --package-lock-only --ignore-scripts --no-audit --no-fund 2>&1 | tail -5) || echo "[$dir] lockfile üretilemedi (devam)"
+            fi
+          done
+
+      - name: Trivy fs scan (unfixed CVE'ler de dahil, cached DB)
+        run: |
+          trivy fs \
+            --cache-dir ~/.cache/trivy \
+            --format json --output trivy-fs.json \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --exit-code 0 \
+            --scanners vuln,misconfig \
+            --parallel 5 \
+            . || true
+          [ -s trivy-fs.json ] || echo '{"Results":[]}' > trivy-fs.json
+
+      - name: Job Summary
+        run: |
+          [ -s trivy-fs.json ] || echo '{"Results":[]}' > trivy-fs.json
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-fs.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' trivy-fs.json)
+          MED=$( jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")]   | length' trivy-fs.json)
+          MISC=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy-fs.json)
+          echo "## 📦 SCA (Trivy fs)" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 Critical  | $CRIT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟠 High      | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Medium    | $MED  |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚙️  Misconfig | $MISC |" >> $GITHUB_STEP_SUMMARY
+          if [ $((CRIT + HIGH)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### CRITICAL/HIGH açıklar (ilk 20)" >> $GITHUB_STEP_SUMMARY
+            echo "| Sev | Paket | Sürüm | CVE | Fix |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]?.Vulnerabilities[]?
+              | select(.Severity=="CRITICAL" or .Severity=="HIGH")
+              | "| \(.Severity) | `\(.PkgName)` | \(.InstalledVersion) | \(.VulnerabilityID) | \(.FixedVersion // "n/a") |"' \
+              trivy-fs.json | sort -u | head -20 >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-sca
+          path: trivy-fs.json
+
+  # =====================================================================
+  # 4) Container Scan — Trivy image (Dockerfile zorunlu, root'ta olmalı)
+  # =====================================================================
+  container-scan:
+    name: 🐳 Container Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [preflight]
+    if: needs.preflight.outputs.has_dockerfile == 'true' && inputs.enable_container_scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Trivy binary
+        id: cache-trivy-bin
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/trivy
+          key: trivy-v0.71.0-linux-64bit
+
+      - name: Install Trivy (cache miss)
+        if: steps.cache-trivy-bin.outputs.cache-hit != 'true'
+        run: |
+          V=0.71.0
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 90 \
+                "https://github.com/aquasecurity/trivy/releases/download/v${V}/trivy_${V}_Linux-64bit.tar.gz" \
+                -o /tmp/trivy.tar.gz; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          sudo tar xz -C /usr/local/bin -f /tmp/trivy.tar.gz trivy
+
+      - name: Cache Trivy vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/trivy/db
+            ~/.cache/trivy/java-db
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-
+
+      - name: Build image (Dockerfile path from preflight)
+        run: |
+          docker build \
+            -f "${{ needs.preflight.outputs.dockerfile_path }}" \
+            -t local/app:scan \
+            "${{ needs.preflight.outputs.dockerfile_dir }}"
+
+      - name: Trivy image scan (cached DB, unfixed dahil)
+        id: df
+        run: |
+          trivy image \
+            --cache-dir ~/.cache/trivy \
+            --format json --output trivy-image.json \
+            --severity CRITICAL,HIGH \
+            --exit-code 0 \
+            --scanners vuln,misconfig \
+            --parallel 5 \
+            local/app:scan || true
+          [ -s trivy-image.json ] || echo '{"Results":[]}' > trivy-image.json
+          echo "found=true" >> $GITHUB_OUTPUT
+
+      - name: Job Summary
+        if: steps.df.outputs.found == 'true'
+        run: |
+          [ -s trivy-image.json ] || echo '{"Results":[]}' > trivy-image.json
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-image.json)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' trivy-image.json)
+          echo "## 🐳 Container Scan (Trivy image)" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 Critical | $CRIT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟠 High     | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          if [ $((CRIT + HIGH)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Top açıklar (ilk 20)" >> $GITHUB_STEP_SUMMARY
+            echo "| Sev | Paket | Sürüm | CVE | Fix |" >> $GITHUB_STEP_SUMMARY
+            echo "|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+            jq -r '.Results[]?.Vulnerabilities[]?
+              | select(.Severity=="CRITICAL" or .Severity=="HIGH")
+              | "| \(.Severity) | `\(.PkgName)` | \(.InstalledVersion) | \(.VulnerabilityID) | \(.FixedVersion // "n/a") |"' \
+              trivy-image.json | sort -u | head -20 >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-container
+          path: trivy-image.json
+          if-no-files-found: ignore
+
+  # =====================================================================
+  # 5a) DAST — ZAP Active Scan (kendi job'u, paralel)
+  # =====================================================================
+  dast-zap:
+    name: 🌐 DAST (ZAP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [preflight]
+    if: needs.preflight.outputs.dast_enabled == 'true' && needs.preflight.outputs.has_dockerfile == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (varsa)
+        if: needs.preflight.outputs.has_dockerfile == 'true'
+        run: |
+          docker build \
+            -f "${{ needs.preflight.outputs.dockerfile_path }}" \
+            -t local/app:test \
+            "${{ needs.preflight.outputs.dockerfile_dir }}"
+
+      - name: Start all components + ZAP scan each
+        id: scan
+        run: |
+          set +e
+          COMPONENTS='${{ needs.preflight.outputs.components_json }}'
+          COUNT=$(echo "$COMPONENTS" | jq 'length')
+          echo "🧩 $COUNT component DAST scan'i koşacak"
+
+          declare -a BG_PIDS=()
+          cleanup() {
+            for pid in "${BG_PIDS[@]}"; do kill $pid 2>/dev/null || true; done
+            docker ps -q | xargs -r docker stop 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # ---- Tüm component'leri başlat ----
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            START=$(echo "$COMP" | jq -r .start)
+            HEALTH=$(echo "$COMP" | jq -r '.health // "/"')
+            WAIT=$(echo "$COMP" | jq -r '.wait_seconds // 30')
+
+            echo "▶ [$NAME] başlatılıyor (port $PORT): $START"
+            bash -c "$START" > "logs-${NAME}.log" 2>&1 &
+            BG_PIDS+=($!)
+
+            READY=false
+            for j in $(seq 1 $WAIT); do
+              if curl -fsS --max-time 2 "http://localhost:${PORT}${HEALTH}" > /dev/null 2>&1; then
+                echo "✅ [$NAME] ${j}sn sonra hazır"
+                READY=true; break
+              fi
+              sleep 1
+            done
+            if [ "$READY" != "true" ]; then
+              echo "⚠️ [$NAME] ${WAIT}sn'de yanıt vermedi. Log:"
+              tail -50 "logs-${NAME}.log" 2>/dev/null || true
+              echo "::warning::[$NAME] DAST hazırlık probe'u başarısız"
+            fi
+          done
+
+          # ---- ZAP work dizini (container user yazabilsin) ----
+          mkdir -p zap-work
+          chmod 777 zap-work
+
+          # ---- Her component için ZAP scan ----
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            URL="http://localhost:$PORT"
+
+            echo "🔍 [$NAME] ZAP scan: $URL"
+            docker run --rm --network=host \
+              -v "$PWD/zap-work:/zap/wrk:rw" \
+              -t ghcr.io/zaproxy/zaproxy:stable \
+              zap-full-scan.py \
+              -t "$URL" \
+              -m 2 -T 3 -a -j \
+              -J "report_${NAME}.json" || true
+
+            # Çıktıyı dışarı taşı (PWD'de toplansın)
+            if [ -f "zap-work/report_${NAME}.json" ]; then
+              cp "zap-work/report_${NAME}.json" "./report_${NAME}.json"
+            fi
+          done
+
+          # ---- Sonuçları birleştir ----
+          shopt -s nullglob
+          ZAP_FILES=(report_*.json)
+          if [ ${#ZAP_FILES[@]} -gt 0 ]; then
+            # Her file'a component name'i embed et
+            for f in "${ZAP_FILES[@]}"; do
+              NAME=$(basename "$f" .json | sed 's/^report_//')
+              jq --arg comp "$NAME" '.site[]? += {component: $comp} | .' "$f" > "${f}.tagged" && mv "${f}.tagged" "$f"
+            done
+            jq -s '{site: [.[].site[]?]}' "${ZAP_FILES[@]}" > zap.json
+          else
+            echo '{"site":[]}' > zap.json
+          fi
+          echo "Toplam $(jq '.site | length' zap.json) site, $(jq '[.site[]?.alerts[]?] | length' zap.json) alert"
+
+      - name: ZAP raporu özetle
+        if: always()
+        run: |
+          echo "## 🌐 DAST (ZAP Active)" >> $GITHUB_STEP_SUMMARY
+          echo "**Component sayısı:** ${{ needs.preflight.outputs.components_count }}" >> $GITHUB_STEP_SUMMARY
+          [ -s zap.json ] || echo '{"site":[]}' > zap.json
+          HIGH=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' zap.json)
+          MED=$( jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' zap.json)
+          LOW=$( jq '[.site[]?.alerts[]? | select(.riskcode=="1")] | length' zap.json)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Risk | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 High   | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟡 Medium | $MED  |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔵 Low    | $LOW  |" >> $GITHUB_STEP_SUMMARY
+          if [ $((HIGH + MED)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Uyarılar (component + istek örnekleri)" >> $GITHUB_STEP_SUMMARY
+            jq -r '
+              .site[]? as $s
+              | $s.alerts[]?
+              | "<details><summary>" +
+                "<b>" + .riskdesc + "</b> [" + ($s.component // "?") + "] — " + .name +
+                " (×" + (.count // "1") + ")" +
+                "</summary>\n\n" +
+                "**Açıklama:** " + ((.desc // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " ") | .[0:300]) + "\n\n" +
+                "**Çözüm:** " + ((.solution // "n/a") | gsub("<[^>]+>"; "") | gsub("\n"; " ") | .[0:300]) + "\n\n" +
+                "**Etkilenen istek örnekleri (" + ((.instances // []) | length | tostring) + " adet):**\n\n" +
+                (
+                  [
+                    (.instances // [])[0:3][]
+                    | "- `" + (.method // "GET") + " " + (.uri // "n/a") + "`"
+                    + (if (.param // "") != "" then "\n  - param: `" + .param + "`" else "" end)
+                    + (if (.attack // "") != "" then "\n  - payload: `" + (.attack | gsub("\n"; " ") | .[0:200]) + "`" else "" end)
+                    + (if (.evidence // "") != "" then "\n  - evidence: `" + (.evidence | gsub("\n"; " ") | .[0:120]) + "`" else "" end)
+                  ] | join("\n")
+                ) +
+                "\n\n</details>\n"
+            ' zap.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-dast
+          path: zap.json
+          if-no-files-found: ignore
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dast-component-logs
+          path: logs-*.log
+          if-no-files-found: ignore
+
+  # =====================================================================
+  # 5b) DAST — Nuclei (kendi job'u, paralel)
+  # =====================================================================
+  dast-nuclei:
+    name: 🎯 DAST (Nuclei)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [preflight]
+    if: needs.preflight.outputs.dast_enabled == 'true' && needs.preflight.outputs.has_dockerfile == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Nuclei binary
+        id: cache-nuclei-bin
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/nuclei
+          key: nuclei-v3.8.0-linux-amd64
+
+      - name: Install Nuclei (cache miss)
+        if: steps.cache-nuclei-bin.outputs.cache-hit != 'true'
+        run: |
+          V=3.8.0
+          for i in 1 2 3; do
+            if curl -sSL --retry 3 --retry-delay 5 --max-time 60 \
+                "https://github.com/projectdiscovery/nuclei/releases/download/v${V}/nuclei_${V}_linux_amd64.zip" \
+                -o /tmp/nuclei.zip; then break; fi
+            echo "Retry $i/3..."; sleep $((i * 5))
+          done
+          unzip -q /tmp/nuclei.zip -d /tmp/nuclei
+          sudo mv /tmp/nuclei/nuclei /usr/local/bin/
+          nuclei -version 2>&1 | head -3
+
+      - name: Cache Nuclei templates
+        id: cache-nuclei-templates
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/nuclei-templates
+            ~/.config/nuclei
+          key: nuclei-templates-${{ github.run_id }}
+          restore-keys: |
+            nuclei-templates-
+
+      - name: Update Nuclei templates (cache miss veya stale)
+        if: steps.cache-nuclei-templates.outputs.cache-hit != 'true'
+        run: nuclei -update-templates -silent 2>&1 | tail -5 || true
+
+      - name: Build image (varsa)
+        if: needs.preflight.outputs.has_dockerfile == 'true'
+        run: |
+          docker build \
+            -f "${{ needs.preflight.outputs.dockerfile_path }}" \
+            -t local/app:test \
+            "${{ needs.preflight.outputs.dockerfile_dir }}"
+
+      - name: Start all components + Nuclei scan each
+        timeout-minutes: 12
+        run: |
+          set +e
+          COMPONENTS='${{ needs.preflight.outputs.components_json }}'
+          COUNT=$(echo "$COMPONENTS" | jq 'length')
+          echo "🧩 $COUNT component Nuclei scan'i koşacak"
+
+          declare -a BG_PIDS=()
+          cleanup() {
+            for pid in "${BG_PIDS[@]}"; do kill $pid 2>/dev/null || true; done
+            docker ps -q | xargs -r docker stop 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # ---- Tüm component'leri başlat ----
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            START=$(echo "$COMP" | jq -r .start)
+            HEALTH=$(echo "$COMP" | jq -r '.health // "/"')
+            WAIT=$(echo "$COMP" | jq -r '.wait_seconds // 30')
+
+            echo "▶ [$NAME] başlatılıyor (port $PORT): $START"
+            bash -c "$START" > "logs-${NAME}.log" 2>&1 &
+            BG_PIDS+=($!)
+
+            READY=false
+            for j in $(seq 1 $WAIT); do
+              if curl -fsS --max-time 2 "http://localhost:${PORT}${HEALTH}" > /dev/null 2>&1; then
+                echo "✅ [$NAME] ${j}sn sonra hazır"
+                READY=true; break
+              fi
+              sleep 1
+            done
+            if [ "$READY" != "true" ]; then
+              echo "⚠️ [$NAME] ${WAIT}sn'de yanıt vermedi"
+              tail -50 "logs-${NAME}.log" 2>/dev/null || true
+            fi
+          done
+
+          # ---- Her component için Nuclei scan ----
+          echo "[]" > nuclei.json
+          for i in $(seq 0 $((COUNT-1))); do
+            COMP=$(echo "$COMPONENTS" | jq -c ".[$i]")
+            NAME=$(echo "$COMP" | jq -r .name)
+            PORT=$(echo "$COMP" | jq -r .port)
+            URL="http://localhost:$PORT"
+
+            echo "🎯 [$NAME] Nuclei scan: $URL"
+            nuclei \
+              -u "$URL" \
+              -tags cve,vulnerability,exposure,misconfiguration,default-logins \
+              -severity critical,high \
+              -rate-limit 50 \
+              -concurrency 10 \
+              -timeout 5 \
+              -retries 1 \
+              -no-interactsh \
+              -silent \
+              -jsonl -o "nuclei-${NAME}.jsonl" \
+              -stats 2>&1 | tail -10 || true
+
+            # Her bulguya component name'i ekle
+            if [ -s "nuclei-${NAME}.jsonl" ]; then
+              jq -c --arg comp "$NAME" '. + {component: $comp}' "nuclei-${NAME}.jsonl" > "nuclei-${NAME}.tagged.jsonl"
+              cat "nuclei-${NAME}.tagged.jsonl" >> nuclei-all.jsonl
+            fi
+          done
+
+          # ---- Sonuçları birleştir ----
+          if [ -s nuclei-all.jsonl ]; then
+            jq -s '.' nuclei-all.jsonl > nuclei.json
+          fi
+          echo "Toplam $(jq 'length' nuclei.json) bulgu"
+
+      - name: Nuclei raporu özetle
+        if: always()
+        run: |
+          echo "## 🎯 DAST (Nuclei templates)" >> $GITHUB_STEP_SUMMARY
+          echo "**Component sayısı:** ${{ needs.preflight.outputs.components_count }}" >> $GITHUB_STEP_SUMMARY
+          [ -s nuclei.json ] || echo '[]' > nuclei.json
+          CRIT=$(jq '[.[] | select(.info.severity=="critical")] | length' nuclei.json)
+          HIGH=$(jq '[.[] | select(.info.severity=="high")]     | length' nuclei.json)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔴 Critical | $CRIT |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟠 High     | $HIGH |" >> $GITHUB_STEP_SUMMARY
+          if [ $((CRIT + HIGH)) -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Bulgular (component bazlı)" >> $GITHUB_STEP_SUMMARY
+            jq -r '.[] | "<details><summary>**\(.info.severity | ascii_upcase)** [\(.component // "?")] — \(.info.name)</summary>\n\nURL: \(.matched-at // .url // "n/a")\n\nTemplate: \(."template-id" // .templateID)\n\n\((.info.description // "n/a") | gsub("\n"; " "))\n\n</details>\n"' nuclei.json >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-nuclei
+          path: nuclei.json
+          if-no-files-found: ignore
+
+  # =====================================================================
+  # 6) VERDICT — GREEN/YELLOW/RED + Commit Status + DevOps response
+  # =====================================================================
+  verdict:
+    name: 🛡️ Verdict (DevOps Response)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [preflight, secret-scan, sast, sca, container-scan, dast-zap, dast-nuclei]
+    if: always() && needs.preflight.result == 'success'
+    steps:
+      - name: Tüm tarama çıktılarını indir
+        uses: actions/download-artifact@v4
+        with:
+          path: scans
+          pattern: scan-*
+          merge-multiple: true
+
+      - name: Skor hesapla
+        id: score
+        run: |
+          set -e
+          ls -la scans/ || true
+
+          # Defaults
+          SECRETS=0; SAST_H=0; SAST_M=0
+          SCA_C=0; SCA_H=0
+          IMG_C=0; IMG_H=0
+          ZAP_H=0; ZAP_M=0
+
+          [ -f scans/gitleaks.json ]    && SECRETS=$(jq 'length' scans/gitleaks.json)
+          if [ -f scans/semgrep.json ]; then
+            SAST_H=$(jq '[.results[] | select(.extra.severity=="ERROR")]   | length' scans/semgrep.json)
+            SAST_M=$(jq '[.results[] | select(.extra.severity=="WARNING")] | length' scans/semgrep.json)
+          fi
+          if [ -f scans/trivy-fs.json ]; then
+            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' scans/trivy-fs.json)
+            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' scans/trivy-fs.json)
+          fi
+          if [ -f scans/trivy-image.json ]; then
+            IMG_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' scans/trivy-image.json)
+            IMG_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")]     | length' scans/trivy-image.json)
+          fi
+          if [ -f scans/zap.json ]; then
+            ZAP_H=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' scans/zap.json)
+            ZAP_M=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' scans/zap.json)
+          fi
+          NUC_C=0; NUC_H=0; NUC_M=0
+          if [ -f scans/nuclei.json ]; then
+            NUC_C=$(jq '[.[] | select(.info.severity=="critical")] | length' scans/nuclei.json)
+            NUC_H=$(jq '[.[] | select(.info.severity=="high")]     | length' scans/nuclei.json)
+            NUC_M=$(jq '[.[] | select(.info.severity=="medium")]   | length' scans/nuclei.json)
+          fi
+
+          TOTAL_CRIT=$((SCA_C + IMG_C + NUC_C))
+          TOTAL_HIGH=$((SAST_H + SCA_H + IMG_H + ZAP_H + NUC_H))
+
+          CTH=${{ inputs.critical_threshold }}
+          HTH=${{ inputs.high_threshold }}
+
+          # Banking sıfır tolerans verdict mantığı:
+          # - Secret veya CRITICAL bulgu → RED (deploy blocked)
+          # - HIGH bulgu                  → YELLOW (review required, deploy stop)
+          # - Hepsi sıfır                 → GREEN (deploy OK)
+          if [ "$SECRETS" -gt 0 ] || [ "$TOTAL_CRIT" -gt "$CTH" ]; then
+            VERDICT="RED"
+            DECISION="DEPLOY_BLOCKED"
+            REASON="Secret ($SECRETS) veya CRITICAL ($TOTAL_CRIT) bulgu var; deploy yasak. Tümünü kapatın."
+          elif [ "$TOTAL_HIGH" -gt "$HTH" ]; then
+            VERDICT="YELLOW"
+            DECISION="REVIEW_REQUIRED"
+            REASON="HIGH ($TOTAL_HIGH) bulgu var; GREEN için tümü kapatılmalı. AppSec onayı olmadan deploy etmeyin."
+          else
+            VERDICT="GREEN"
+            DECISION="DEPLOY_OK"
+            REASON="CRITICAL ve HIGH bulgu yok, secret yok; deploy edilebilir."
+          fi
+
+          # Top findings — DevOps tek bakışta görsün
+          TOP_SECRETS='[]'
+          TOP_SAST='[]'
+          TOP_SCA='[]'
+          TOP_IMG='[]'
+          TOP_DAST='[]'
+          TOP_NUCLEI='[]'
+          [ -f scans/gitleaks.json ]    && TOP_SECRETS=$(jq '[.[] | {rule: .RuleID, file: .File, line: .StartLine}] | .[0:5]' scans/gitleaks.json)
+          [ -f scans/semgrep.json ]     && TOP_SAST=$(jq '[.results[] | select(.extra.severity=="ERROR") | {sev: .extra.severity, rule: .check_id, file: .path, line: .start.line, msg: (.extra.message | gsub("\n"; " ") | .[0:200])}] | .[0:5]' scans/semgrep.json)
+          [ -f scans/trivy-fs.json ]    && TOP_SCA=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" or .Severity=="HIGH") | {sev: .Severity, pkg: .PkgName, version: .InstalledVersion, cve: .VulnerabilityID, fix: (.FixedVersion // "n/a")}] | unique | .[0:5]' scans/trivy-fs.json)
+          [ -f scans/trivy-image.json ] && TOP_IMG=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | {sev: .Severity, pkg: .PkgName, version: .InstalledVersion, cve: .VulnerabilityID, fix: (.FixedVersion // "n/a")}] | unique | .[0:5]' scans/trivy-image.json)
+          [ -f scans/zap.json ]         && TOP_DAST=$(jq '[
+            .site[]? as $s
+            | $s.alerts[]?
+            | select(.riskcode=="2" or .riskcode=="3")
+            | {
+                risk: .riskdesc,
+                name: .name,
+                component: ($s.component // "?"),
+                count: .count,
+                example_method: ((.instances // [])[0].method // ""),
+                example_uri:    ((.instances // [])[0].uri // ""),
+                example_param:  ((.instances // [])[0].param // ""),
+                example_payload: (((.instances // [])[0].attack // "") | .[0:200]),
+                example_evidence: (((.instances // [])[0].evidence // "") | .[0:120])
+              }
+          ] | .[0:5]' scans/zap.json)
+          [ -f scans/nuclei.json ]      && TOP_NUCLEI=$(jq '[.[] | select(.info.severity=="critical" or .info.severity=="high" or .info.severity=="medium") | {sev: .info.severity, name: .info.name, template: (."template-id" // .templateID), url: (."matched-at" // .url // "n/a")}] | .[0:5]' scans/nuclei.json)
+
+          # JSON response — DevOps bunu okuyacak
+          jq -n \
+            --arg verdict   "$VERDICT" \
+            --arg decision  "$DECISION" \
+            --arg reason    "$REASON" \
+            --arg commit    "${{ github.sha }}" \
+            --arg repo      "${{ github.repository }}" \
+            --arg ref       "${{ github.ref }}" \
+            --arg actor     "${{ github.actor }}" \
+            --arg run_url   "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson cth $CTH --argjson hth $HTH \
+            --argjson secrets $SECRETS --argjson sast_h $SAST_H --argjson sast_m $SAST_M \
+            --argjson sca_c $SCA_C --argjson sca_h $SCA_H \
+            --argjson img_c $IMG_C --argjson img_h $IMG_H \
+            --argjson zap_h $ZAP_H --argjson zap_m $ZAP_M \
+            --argjson nuc_c $NUC_C --argjson nuc_h $NUC_H --argjson nuc_m $NUC_M \
+            --argjson tcrit $TOTAL_CRIT --argjson thigh $TOTAL_HIGH \
+            --argjson top_secrets "$TOP_SECRETS" \
+            --argjson top_sast "$TOP_SAST" \
+            --argjson top_sca "$TOP_SCA" \
+            --argjson top_img "$TOP_IMG" \
+            --argjson top_dast "$TOP_DAST" \
+            --argjson top_nuclei "$TOP_NUCLEI" \
+            --arg project_type    "${{ needs.preflight.outputs.project_type }}" \
+            --arg has_dockerfile  "${{ needs.preflight.outputs.has_dockerfile }}" \
+            --arg has_lockfile    "${{ needs.preflight.outputs.has_lockfile }}" \
+            --arg has_appsec_yml  "${{ needs.preflight.outputs.has_appsec_yml }}" \
+            --arg dast_enabled    "${{ needs.preflight.outputs.dast_enabled }}" \
+            '{
+              verdict: $verdict, decision: $decision, reason: $reason,
+              commit: $commit, repo: $repo, ref: $ref, actor: $actor, run_url: $run_url,
+              project: {
+                type: $project_type,
+                has_dockerfile: $has_dockerfile,
+                has_lockfile: $has_lockfile,
+                has_appsec_yml: $has_appsec_yml,
+                dast_enabled: $dast_enabled
+              },
+              thresholds: {critical: $cth, high: $hth},
+              findings: {
+                secrets: $secrets, sast_high: $sast_h, sast_medium: $sast_m,
+                sca_critical: $sca_c, sca_high: $sca_h,
+                image_critical: $img_c, image_high: $img_h,
+                dast_high: $zap_h, dast_medium: $zap_m,
+                nuclei_critical: $nuc_c, nuclei_high: $nuc_h, nuclei_medium: $nuc_m,
+                total_critical: $tcrit, total_high: $thigh
+              },
+              top_findings: {
+                secrets: $top_secrets, sast: $top_sast,
+                sca: $top_sca, image: $top_img,
+                dast: $top_dast, nuclei: $top_nuclei
+              }
+            }' > verdict.json
+
+          # Workflow outputs
+          echo "verdict=$VERDICT"   >> $GITHUB_OUTPUT
+          echo "decision=$DECISION" >> $GITHUB_OUTPUT
+          echo "reason=$REASON"     >> $GITHUB_OUTPUT
+          echo "secrets=$SECRETS"   >> $GITHUB_OUTPUT
+          echo "total_crit=$TOTAL_CRIT" >> $GITHUB_OUTPUT
+          echo "total_high=$TOTAL_HIGH" >> $GITHUB_OUTPUT
+
+          cat verdict.json
+
+      - name: Verdict Job Summary (DevOps karar ekranı)
+        run: |
+          V="${{ steps.score.outputs.verdict }}"
+          D="${{ steps.score.outputs.decision }}"
+          R="${{ steps.score.outputs.reason }}"
+
+          case "$V" in
+            GREEN)  ICON="🟢"; BANNER="DEPLOY OK — Tüm bulgular kapalı, deploy edilebilir" ;;
+            YELLOW) ICON="🟡"; BANNER="DEPLOY STOP — HIGH bulgular kapatılmalı, AppSec onayı gerekli" ;;
+            RED)    ICON="🔴"; BANNER="DEPLOY BLOCKED — Secret/CRITICAL var, deploy yasak" ;;
+          esac
+
+          {
+            echo "# $ICON Verdict: **$V**"
+            echo ""
+            echo "## $BANNER"
+            echo ""
+            echo "**Karar:** \`$D\`"
+            echo "**Sebep:** $R"
+            echo ""
+            echo "### DevOps için response"
+            echo '```json'
+            cat verdict.json
+            echo '```'
+            echo ""
+            echo "### Özet sayım"
+            echo "| Tarama | Bulgu |"
+            echo "|---|---|"
+            echo "| 🔐 Secret              | ${{ steps.score.outputs.secrets }} |"
+            echo "| 🔴 Toplam CRITICAL     | ${{ steps.score.outputs.total_crit }} |"
+            echo "| 🟠 Toplam HIGH         | ${{ steps.score.outputs.total_high }} |"
+            echo ""
+            echo "### Top 5 bulgu (her kategoriden)"
+            echo ""
+            echo "<details><summary>🔐 Secrets</summary>"; echo ""
+            jq -r '.top_findings.secrets[] | "- `\(.rule)` → `\(.file):\(.line)`"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🔍 SAST</summary>"; echo ""
+            jq -r '.top_findings.sast[] | "- **\(.sev)** `\(.rule)` → `\(.file):\(.line)`\n  > \(.msg)"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>📦 SCA</summary>"; echo ""
+            jq -r '.top_findings.sca[] | "- **\(.sev)** `\(.pkg)@\(.version)` → \(.cve) (fix: \(.fix))"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🐳 Container</summary>"; echo ""
+            jq -r '.top_findings.image[] | "- **\(.sev)** `\(.pkg)@\(.version)` → \(.cve) (fix: \(.fix))"' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🌐 DAST (ZAP)</summary>"; echo ""
+            jq -r '.top_findings.dast[] |
+              "- **\(.risk)** [\(.component)] \(.name) (×\(.count))" +
+              (if .example_uri != "" then "\n  - URI: `\(.example_method) \(.example_uri)`" else "" end) +
+              (if .example_param != "" then "\n  - Param: `\(.example_param)`" else "" end) +
+              (if .example_payload != "" then "\n  - Payload: `\(.example_payload)`" else "" end) +
+              (if .example_evidence != "" then "\n  - Evidence: `\(.example_evidence)`" else "" end)
+            ' verdict.json
+            echo ""; echo "</details>"
+            echo "<details><summary>🎯 Nuclei</summary>"; echo ""
+            jq -r '.top_findings.nuclei[] | "- **\(.sev | ascii_upcase)** \(.name) (`\(.template)`) → \(.url)"' verdict.json
+            echo ""; echo "</details>"
+            echo ""
+            echo "Tam detay: bu run'ın **Artifacts** kısmı + jobların **Summary** sekmeleri."
+          } >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verdict
+          path: verdict.json
+
+      - name: Commit Status (DevOps gözüne görünür)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const v = "${{ steps.score.outputs.verdict }}";
+            const d = "${{ steps.score.outputs.decision }}";
+            const reason = `${{ steps.score.outputs.reason }}`;
+            // Banking sıfır tolerans: sadece GREEN deploy'a izin verir.
+            // YELLOW ve RED — commit status FAILURE, branch protection ile merge blok.
+            const state = v === "GREEN" ? "success" : "failure";
+            const description = `${v} — ${d} — ${reason}`.slice(0, 140);
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state,
+              context: "AppSec / Verdict",
+              description,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+
+      - name: RED ise soft-fail değilse exit 1
+        if: steps.score.outputs.verdict == 'RED' && inputs.soft_fail == false
+        run: |
+          echo "::error::RED verdict + soft_fail=false → workflow FAIL"
+          exit 1
