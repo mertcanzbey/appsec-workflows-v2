@@ -1079,7 +1079,7 @@ jobs:
             echo "| Secret scanning | \`$(jq -r '.enablement.secret_scanning // "?"' ghas.json)\` |"
             echo "| Dependabot      | \`$(jq -r '.enablement.dependabot // "?"' ghas.json)\` |"
             echo "| Code scanning   | \`$(jq -r '.enablement.code_scanning // "?"' ghas.json)\` |"
-            echo "| Compliant       | \`$(jq -r '.compliant // "?"' ghas.json)\` |"
+            echo "| Compliant       | \`$(jq -r 'if has("compliant") then (.compliant|tostring) else "?" end' ghas.json)\` |"
             echo ""
             echo "| Kaynak | Critical | High |"
             echo "|---|---|---|"
@@ -1163,9 +1163,11 @@ jobs:
             GHAS_CS_C=$(jq '.findings.cs_crit // 0'  scans/ghas.json)
             GHAS_CS_H=$(jq '.findings.cs_high // 0'  scans/ghas.json)
             GHAS_SECRETS=$(jq '.findings.secrets // 0' scans/ghas.json)
-            GHAS_AVAILABLE=$(jq -r '.available // true' scans/ghas.json)
-            GHAS_COMPLIANT=$(jq -r '.compliant // true' scans/ghas.json)
-            GHAS_ENFORCED=$(jq -r '.enforced // false' scans/ghas.json)
+            # DİKKAT: jq'da `// true` false değerini de true yapar (// false'u boş sayar).
+            # Bu yüzden has() ile açıkça oku.
+            GHAS_AVAILABLE=$(jq -r 'if has("available") then (.available|tostring) else "true" end' scans/ghas.json)
+            GHAS_COMPLIANT=$(jq -r 'if has("compliant") then (.compliant|tostring) else "true" end' scans/ghas.json)
+            GHAS_ENFORCED=$(jq -r 'if has("enforced") then (.enforced|tostring) else "false" end' scans/ghas.json)
             GHAS_VIOL=$(jq -r '.violations // [] | join("; ")' scans/ghas.json)
           fi
 
