@@ -1,13 +1,21 @@
 name: Security
- 
+
 on:
   push:
- 
+
 permissions:
   contents: read
   statuses: write
   actions: read
- 
+
 jobs:
   appsec:
     uses: mertcanzbey/appsec-workflows-v2/.github/workflows/security-reusable.yml@main
+    # GHAS okuması için token gerekir (default GITHUB_TOKEN yetmez):
+    #   • Kurumsal  → org-level secret: GHAS_APP_ID + GHAS_APP_PRIVATE_KEY (GitHub App)
+    #   • Kişisel   → repo/org secret: APPSEC_GHAS_TOKEN (fine-grained PAT)
+    # secrets: inherit yerine açık geçiş (hangileri varsa kullanılır):
+    secrets:
+      ghas_token:           ${{ secrets.APPSEC_GHAS_TOKEN }}
+      ghas_app_id:          ${{ secrets.GHAS_APP_ID }}
+      ghas_app_private_key: ${{ secrets.GHAS_APP_PRIVATE_KEY }}

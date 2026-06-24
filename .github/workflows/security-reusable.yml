@@ -46,6 +46,26 @@ on:
       soft_fail:
         type: boolean
         default: true
+      # --- GHAS (GitHub Advanced Security) entegrasyonu ---
+      enable_ghas:
+        description: 'GHAS native alert toplama (Dependabot + Secret scanning + Code scanning) aktif mi'
+        type: boolean
+        default: true
+      enforce_ghas:
+        description: 'GHAS özelliği kapalı VEYA token okuyamıyorsa fail-closed → RED (sıfır tolerans)'
+        type: boolean
+        default: true
+    secrets:
+      # Token önceliği: GitHub App (kurumsal) > PAT (kişisel/test). İkisi de yoksa enforce_ghas RED yapar.
+      ghas_token:
+        description: 'GHAS alert API okuması için PAT (fine-grained: Dependabot/Secret/Code scanning + Administration read)'
+        required: false
+      ghas_app_id:
+        description: 'Kurumsal: GitHub App ID (org-level secret). Varsa runtime installation token mint edilir.'
+        required: false
+      ghas_app_private_key:
+        description: 'Kurumsal: GitHub App private key (org-level secret)'
+        required: false
 
 permissions:
   contents: read
@@ -948,13 +968,147 @@ jobs:
           if-no-files-found: ignore
 
   # =====================================================================
+  # 5c) GHAS Native — Dependabot + Secret scanning + Code scanning alerts
+  #     Token: GitHub App (kurumsal) > PAT (kişisel). Yoksa enforce → RED.
+  #     Enablement fail-closed: özellik kapalıysa "0 alert" güvenli sayılmaz.
+  # =====================================================================
+  ghas:
+    name: 🛰️ GHAS Native Alerts
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    if: inputs.enable_ghas
+    steps:
+      # --- Token çöz: App varsa installation token mint et, yoksa PAT kullan ---
+      - name: Resolve token (App > PAT)
+        id: tok
+        env:
+          APP_ID: ${{ secrets.ghas_app_id }}
+        run: |
+          if [ -n "$APP_ID" ]; then
+            echo "mode=app" >> $GITHUB_OUTPUT
+          else
+            echo "mode=pat" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Mint GitHub App token (kurumsal)
+        id: app
+        if: steps.tok.outputs.mode == 'app'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.ghas_app_id }}
+          private-key: ${{ secrets.ghas_app_private_key }}
+
+      - name: GHAS alert'leri oku + enablement (fail-closed)
+        id: read
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.ghas_token }}
+          R: ${{ github.repository }}
+          ENFORCE: ${{ inputs.enforce_ghas }}
+        run: |
+          set +e
+
+          # ---- Token yoksa ----
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::GHAS token yok (ne App ne PAT). enforce_ghas=$ENFORCE"
+            jq -n --argjson en "$([ "$ENFORCE" = "true" ] && echo true || echo false)" \
+              '{available:false, enforced:$en, compliant:false,
+                enablement:{}, findings:{dep_crit:0,dep_high:0,cs_crit:0,cs_high:0,secrets:0},
+                violations:["GHAS token yok — alert okunamadı"]}' > ghas.json
+            cat ghas.json
+            exit 0
+          fi
+
+          # ---- Enablement (security_and_analysis admin gerektirir) ----
+          SA=$(gh api "repos/$R" --jq '.security_and_analysis' 2>/dev/null)
+          if [ -z "$SA" ] || [ "$SA" = "null" ]; then
+            echo "::warning::security_and_analysis okunamadı (token Administration:read yetkisi yok olabilir)"
+            SA='{}'
+          fi
+          SECRET_EN=$(echo "$SA" | jq -r '.secret_scanning.status // "unknown"')
+          # Dependabot alerts enablement ayrı endpoint (204 açık / 404 kapalı)
+          gh api "repos/$R/vulnerability-alerts" --silent 2>/dev/null && DEP_EN="enabled" || DEP_EN="disabled"
+          # Code scanning: default-setup state
+          CS_STATE=$(gh api "repos/$R/code-scanning/default-setup" --jq '.state' 2>/dev/null || echo "unknown")
+
+          # ---- Alert sayımları ----
+          gh api --paginate "repos/$R/dependabot/alerts?state=open&per_page=100" > dep.json 2>/dev/null || echo '[]' > dep.json
+          [ -s dep.json ] || echo '[]' > dep.json
+          DEP_C=$(jq '[.[]?|select(.security_advisory.severity=="critical")]|length' dep.json)
+          DEP_H=$(jq '[.[]?|select(.security_advisory.severity=="high")]|length' dep.json)
+
+          gh api --paginate "repos/$R/secret-scanning/alerts?state=open&per_page=100" > sec.json 2>/dev/null || echo '[]' > sec.json
+          [ -s sec.json ] || echo '[]' > sec.json
+          SECRETS=$(jq 'if type=="array" then length else 0 end' sec.json)
+
+          gh api --paginate "repos/$R/code-scanning/alerts?state=open&per_page=100" > cs.json 2>/dev/null || echo '[]' > cs.json
+          [ -s cs.json ] || echo '[]' > cs.json
+          CS_C=$(jq 'if type=="array" then [.[]?|select(.rule.security_severity_level=="critical")]|length else 0 end' cs.json)
+          CS_H=$(jq 'if type=="array" then [.[]?|select(.rule.security_severity_level=="high")]|length else 0 end' cs.json)
+
+          # ---- Compliance: enforce isteniyorsa gerekli özellikler açık olmalı ----
+          VIOL='[]'
+          COMPLIANT=true
+          if [ "$ENFORCE" = "true" ]; then
+            [ "$SECRET_EN" != "enabled" ] && { VIOL=$(echo "$VIOL" | jq '. + ["secret scanning kapalı"]'); COMPLIANT=false; }
+            [ "$DEP_EN" != "enabled" ]    && { VIOL=$(echo "$VIOL" | jq '. + ["Dependabot alerts kapalı"]'); COMPLIANT=false; }
+            [ "$CS_STATE" != "configured" ] && { VIOL=$(echo "$VIOL" | jq '. + ["Code scanning (default setup) configured değil"]'); COMPLIANT=false; }
+          fi
+
+          jq -n \
+            --argjson en "$([ "$ENFORCE" = "true" ] && echo true || echo false)" \
+            --argjson comp "$COMPLIANT" \
+            --arg secret_en "$SECRET_EN" --arg dep_en "$DEP_EN" --arg cs_state "$CS_STATE" \
+            --argjson dc "$DEP_C" --argjson dh "$DEP_H" \
+            --argjson cc "$CS_C" --argjson ch "$CS_H" --argjson s "$SECRETS" \
+            --argjson viol "$VIOL" \
+            '{available:true, enforced:$en, compliant:$comp,
+              enablement:{secret_scanning:$secret_en, dependabot:$dep_en, code_scanning:$cs_state},
+              findings:{dep_crit:$dc, dep_high:$dh, cs_crit:$cc, cs_high:$ch, secrets:$s},
+              violations:$viol}' > ghas.json
+          cat ghas.json
+
+      - name: Job Summary
+        if: always()
+        run: |
+          [ -s ghas.json ] || echo '{}' > ghas.json
+          {
+            echo "## 🛰️ GHAS Native Alerts"
+            echo ""
+            echo "| Özellik | Durum |"
+            echo "|---|---|"
+            echo "| Secret scanning | \`$(jq -r '.enablement.secret_scanning // "?"' ghas.json)\` |"
+            echo "| Dependabot      | \`$(jq -r '.enablement.dependabot // "?"' ghas.json)\` |"
+            echo "| Code scanning   | \`$(jq -r '.enablement.code_scanning // "?"' ghas.json)\` |"
+            echo "| Compliant       | \`$(jq -r '.compliant // "?"' ghas.json)\` |"
+            echo ""
+            echo "| Kaynak | Critical | High |"
+            echo "|---|---|---|"
+            echo "| Dependabot    | $(jq -r '.findings.dep_crit // 0' ghas.json) | $(jq -r '.findings.dep_high // 0' ghas.json) |"
+            echo "| Code scanning | $(jq -r '.findings.cs_crit // 0' ghas.json) | $(jq -r '.findings.cs_high // 0' ghas.json) |"
+            echo "| Secret scanning | $(jq -r '.findings.secrets // 0' ghas.json) | (her secret = RED) |"
+            VIOL=$(jq -r '.violations // [] | length' ghas.json)
+            if [ "$VIOL" -gt 0 ]; then
+              echo ""
+              echo "**❌ Compliance ihlalleri (fail-closed → RED):**"
+              jq -r '.violations[] | "- \(.)"' ghas.json
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-ghas
+          path: ghas.json
+          if-no-files-found: ignore
+
+  # =====================================================================
   # 6) VERDICT — GREEN/YELLOW/RED + Commit Status + DevOps response
   # =====================================================================
   verdict:
     name: 🛡️ Verdict (DevOps Response)
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [preflight, secret-scan, sast, sca, container-scan, dast-zap, dast-nuclei]
+    needs: [preflight, secret-scan, sast, sca, container-scan, dast-zap, dast-nuclei, ghas]
     if: always() && needs.preflight.result == 'success'
     steps:
       - name: Tüm tarama çıktılarını indir
@@ -1000,17 +1154,38 @@ jobs:
             NUC_M=$(jq '[.[] | select(.info.severity=="medium")]   | length' scans/nuclei.json)
           fi
 
-          TOTAL_CRIT=$((SCA_C + IMG_C + NUC_C))
-          TOTAL_HIGH=$((SAST_H + SCA_H + IMG_H + ZAP_H + NUC_H))
+          # ---- GHAS native (Dependabot + Code scanning + Secret scanning) ----
+          GHAS_DEP_C=0; GHAS_DEP_H=0; GHAS_CS_C=0; GHAS_CS_H=0; GHAS_SECRETS=0
+          GHAS_AVAILABLE=true; GHAS_COMPLIANT=true; GHAS_ENFORCED=false; GHAS_VIOL=""
+          if [ -f scans/ghas.json ]; then
+            GHAS_DEP_C=$(jq '.findings.dep_crit // 0' scans/ghas.json)
+            GHAS_DEP_H=$(jq '.findings.dep_high // 0' scans/ghas.json)
+            GHAS_CS_C=$(jq '.findings.cs_crit // 0'  scans/ghas.json)
+            GHAS_CS_H=$(jq '.findings.cs_high // 0'  scans/ghas.json)
+            GHAS_SECRETS=$(jq '.findings.secrets // 0' scans/ghas.json)
+            GHAS_AVAILABLE=$(jq -r '.available // true' scans/ghas.json)
+            GHAS_COMPLIANT=$(jq -r '.compliant // true' scans/ghas.json)
+            GHAS_ENFORCED=$(jq -r '.enforced // false' scans/ghas.json)
+            GHAS_VIOL=$(jq -r '.violations // [] | join("; ")' scans/ghas.json)
+          fi
+
+          TOTAL_CRIT=$((SCA_C + IMG_C + NUC_C + GHAS_DEP_C + GHAS_CS_C))
+          TOTAL_HIGH=$((SAST_H + SCA_H + IMG_H + ZAP_H + NUC_H + GHAS_DEP_H + GHAS_CS_H))
+          SECRETS=$((SECRETS + GHAS_SECRETS))
 
           CTH=${{ inputs.critical_threshold }}
           HTH=${{ inputs.high_threshold }}
 
           # Banking sıfır tolerans verdict mantığı:
+          # - GHAS fail-closed (enforce + uyumsuz/okunamadı) → RED
           # - Secret veya CRITICAL bulgu → RED (deploy blocked)
           # - HIGH bulgu                  → YELLOW (review required, deploy stop)
           # - Hepsi sıfır                 → GREEN (deploy OK)
-          if [ "$SECRETS" -gt 0 ] || [ "$TOTAL_CRIT" -gt "$CTH" ]; then
+          if [ "$GHAS_ENFORCED" = "true" ] && { [ "$GHAS_COMPLIANT" != "true" ] || [ "$GHAS_AVAILABLE" != "true" ]; }; then
+            VERDICT="RED"
+            DECISION="DEPLOY_BLOCKED"
+            REASON="GHAS uyum ihlali (fail-closed): ${GHAS_VIOL:-GHAS okunamadı}. Repo'da gerekli güvenlik özellikleri açık olmalı."
+          elif [ "$SECRETS" -gt 0 ] || [ "$TOTAL_CRIT" -gt "$CTH" ]; then
             VERDICT="RED"
             DECISION="DEPLOY_BLOCKED"
             REASON="Secret ($SECRETS) veya CRITICAL ($TOTAL_CRIT) bulgu var; deploy yasak. Tümünü kapatın."
@@ -1069,6 +1244,10 @@ jobs:
             --argjson img_c $IMG_C --argjson img_h $IMG_H \
             --argjson zap_h $ZAP_H --argjson zap_m $ZAP_M \
             --argjson nuc_c $NUC_C --argjson nuc_h $NUC_H --argjson nuc_m $NUC_M \
+            --argjson ghas_dep_c $GHAS_DEP_C --argjson ghas_dep_h $GHAS_DEP_H \
+            --argjson ghas_cs_c $GHAS_CS_C --argjson ghas_cs_h $GHAS_CS_H --argjson ghas_secrets $GHAS_SECRETS \
+            --argjson ghas_available "$GHAS_AVAILABLE" --argjson ghas_compliant "$GHAS_COMPLIANT" \
+            --argjson ghas_enforced "$GHAS_ENFORCED" --arg ghas_viol "$GHAS_VIOL" \
             --argjson tcrit $TOTAL_CRIT --argjson thigh $TOTAL_HIGH \
             --argjson top_secrets "$TOP_SECRETS" \
             --argjson top_sast "$TOP_SAST" \
@@ -1098,7 +1277,14 @@ jobs:
                 image_critical: $img_c, image_high: $img_h,
                 dast_high: $zap_h, dast_medium: $zap_m,
                 nuclei_critical: $nuc_c, nuclei_high: $nuc_h, nuclei_medium: $nuc_m,
+                ghas_dependabot_critical: $ghas_dep_c, ghas_dependabot_high: $ghas_dep_h,
+                ghas_codescan_critical: $ghas_cs_c, ghas_codescan_high: $ghas_cs_h,
+                ghas_secrets: $ghas_secrets,
                 total_critical: $tcrit, total_high: $thigh
+              },
+              ghas: {
+                available: $ghas_available, compliant: $ghas_compliant,
+                enforced: $ghas_enforced, violations: $ghas_viol
               },
               top_findings: {
                 secrets: $top_secrets, sast: $top_sast,
