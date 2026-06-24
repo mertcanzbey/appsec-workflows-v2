@@ -382,6 +382,55 @@ NOTLAR:
     component bazlı gösterilir.
 
 --------------------------------------------------------------
+16) GHAS (GitHub Advanced Security) ENTEGRASYONU — v2
+--------------------------------------------------------------
+
+v2 pipeline, GitHub'ın kendi güvenlik taramalarını da verdict'e katar:
+
+  - Dependabot alerts      → dependency CVE (GitHub Advisory DB)
+  - Secret scanning alerts → GitHub'ın doğrulanmış secret tespiti
+  - CodeQL (in-pipeline)   → SAST, security-extended suite, tam bu commit
+
+Bu kaynaklarda CRITICAL/HIGH varsa → verdict YELLOW/RED (sıfır tolerans).
+
+16.1) REPO'DA AÇIK OLMASI GEREKEN ÖZELLİKLER (enforce_ghas=true ise ZORUNLU)
+
+  Settings → Code security and analysis → şunları aç:
+    - Dependabot alerts            → ENABLED
+    - Secret scanning              → ENABLED
+  (Kapalıysa pipeline fail-closed davranır: "0 alert" güvenli sayılmaz → RED.)
+
+  NOT: Code scanning'i repo'da açmana GEREK YOK — CodeQL'i pipeline kendi
+  içinde (security-extended) deterministik koşar.
+
+16.2) TOKEN (alert API'leri default GITHUB_TOKEN ile okunamaz)
+
+  KURUMSAL (önerilen): AppSec ekibi org'a TEK GitHub App kurar.
+    - App izinleri (read): Dependabot alerts, Secret scanning alerts,
+                           Administration, Metadata
+    - Org-level secret: GHAS_APP_ID + GHAS_APP_PRIVATE_KEY
+    - Vibecoder HİÇBİR ŞEY yapmaz; pipeline runtime'da kısa ömürlü token mint eder.
+
+  KİŞİSEL / TEST: fine-grained PAT (aynı read izinleri) → repo secret: APPSEC_GHAS_TOKEN
+
+16.3) CALLER (security.yml) — token'ı geçir
+
+  jobs:
+    appsec:
+      uses: <ORG>/appsec-workflows-v2/.github/workflows/security-reusable.yml@main
+      secrets:
+        ghas_token:           ${{ secrets.APPSEC_GHAS_TOKEN }}      # kişisel
+        ghas_app_id:          ${{ secrets.GHAS_APP_ID }}            # kurumsal
+        ghas_app_private_key: ${{ secrets.GHAS_APP_PRIVATE_KEY }}   # kurumsal
+
+16.4) ENFORCEMENT (verdict'in "dişi")
+
+  RED commit status tek başına yetmez. Org ruleset / branch protection ile
+  "AppSec / Verdict" status'u REQUIRED yapılmalı — ancak o zaman RED gerçekten
+  merge/deploy'u bloklar.
+
+
+--------------------------------------------------------------
 SON
 --------------------------------------------------------------
 

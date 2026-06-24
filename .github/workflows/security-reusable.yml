@@ -48,7 +48,7 @@ on:
         default: true
       # --- GHAS (GitHub Advanced Security) entegrasyonu ---
       enable_ghas:
-        description: 'GHAS native alert toplama (Dependabot + Secret scanning + Code scanning) aktif mi'
+        description: 'GHAS native alert toplama (Dependabot + Secret scanning) aktif mi. Code scanning = in-pipeline CodeQL job.'
         type: boolean
         default: true
       enforce_ghas:
@@ -968,7 +968,97 @@ jobs:
           if-no-files-found: ignore
 
   # =====================================================================
-  # 5c) GHAS Native — Dependabot + Secret scanning + Code scanning alerts
+  # 5c) CodeQL — in-pipeline SAST (deterministik: tam BU commit, SARIF parse)
+  #     security-extended suite. upload:false → ekstra izin yok, çift sayım yok.
+  # =====================================================================
+  codeql:
+    name: 🧬 CodeQL (SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [preflight]
+    if: needs.preflight.outputs.project_type != 'unknown'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dil eşle (project_type → CodeQL language)
+        id: lang
+        run: |
+          case "${{ needs.preflight.outputs.project_type }}" in
+            nodejs) L=javascript-typescript ;;
+            python) L=python ;;
+            go)     L=go ;;
+            java)   L=java-kotlin ;;
+            *)      L="" ;;
+          esac
+          echo "lang=$L" >> $GITHUB_OUTPUT
+          echo "CodeQL language: ${L:-<desteklenmiyor>}"
+
+      - name: CodeQL init
+        if: steps.lang.outputs.lang != ''
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.lang.outputs.lang }}
+          queries: security-extended
+
+      - name: Autobuild (derlenen diller için)
+        if: steps.lang.outputs.lang != ''
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL analyze (SARIF üret, upload etme)
+        if: steps.lang.outputs.lang != ''
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-out
+          upload: false
+
+      - name: SARIF parse (security-severity → critical/high)
+        if: always()
+        run: |
+          set +e
+          SARIF=$(find codeql-out -name '*.sarif' 2>/dev/null | head -1)
+          if [ -z "$SARIF" ] || [ ! -s "$SARIF" ]; then
+            echo "::warning::CodeQL SARIF yok (dil desteklenmiyor veya analiz koşmadı)"
+            echo '{"available":false,"crit":0,"high":0,"med":0}' > codeql.json
+            cat codeql.json; exit 0
+          fi
+          # Rule id → security-severity (0-10) haritası (driver + extensions), sonra results'ı say.
+          # GitHub eşlemesi: crit >=9.0, high 7.0-8.9, med 4.0-6.9.
+          jq '
+            [ .runs[] ] as $runs
+            | ( [ $runs[] | ((.tool.driver.rules // []) + ([ .tool.extensions[]?.rules[]? ])) ] | add // [] ) as $rules
+            | ( reduce $rules[] as $r ({}; .[$r.id] = (($r.properties["security-severity"] // "0") | tonumber)) ) as $sev
+            | [ $runs[].results[]? | ($sev[(.ruleId // .rule.id)] // 0) ] as $scores
+            | { available: true,
+                crit: ([ $scores[] | select(. >= 9.0) ] | length),
+                high: ([ $scores[] | select(. >= 7.0 and . < 9.0) ] | length),
+                med:  ([ $scores[] | select(. >= 4.0 and . < 7.0) ] | length) }
+          ' "$SARIF" > codeql.json
+          [ -s codeql.json ] || echo '{"available":false,"crit":0,"high":0,"med":0}' > codeql.json
+          cat codeql.json
+
+      - name: Job Summary
+        if: always()
+        run: |
+          [ -s codeql.json ] || echo '{"available":false,"crit":0,"high":0,"med":0}' > codeql.json
+          {
+            echo "## 🧬 CodeQL (in-pipeline SAST, security-extended)"
+            echo "| Severity | Count |"
+            echo "|---|---|"
+            echo "| 🔴 Critical | $(jq -r '.crit // 0' codeql.json) |"
+            echo "| 🟠 High     | $(jq -r '.high // 0' codeql.json) |"
+            echo "| 🟡 Medium   | $(jq -r '.med // 0' codeql.json) |"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-codeql
+          path: codeql.json
+          if-no-files-found: ignore
+
+  # =====================================================================
+  # 5d) GHAS Native — Dependabot + Secret scanning alerts (API)
+  #     Code scanning'i CodeQL job'u in-pipeline sağlıyor (burada okunmaz).
   #     Token: GitHub App (kurumsal) > PAT (kişisel). Yoksa enforce → RED.
   #     Enablement fail-closed: özellik kapalıysa "0 alert" güvenli sayılmaz.
   # =====================================================================
@@ -1012,7 +1102,7 @@ jobs:
             echo "::warning::GHAS token yok (ne App ne PAT). enforce_ghas=$ENFORCE"
             jq -n --argjson en "$([ "$ENFORCE" = "true" ] && echo true || echo false)" \
               '{available:false, enforced:$en, compliant:false,
-                enablement:{}, findings:{dep_crit:0,dep_high:0,cs_crit:0,cs_high:0,secrets:0},
+                enablement:{}, findings:{dep_crit:0,dep_high:0,secrets:0},
                 violations:["GHAS token yok — alert okunamadı"]}' > ghas.json
             cat ghas.json
             exit 0
@@ -1027,10 +1117,8 @@ jobs:
           SECRET_EN=$(echo "$SA" | jq -r '.secret_scanning.status // "unknown"')
           # Dependabot alerts enablement ayrı endpoint (204 açık / 404 kapalı)
           gh api "repos/$R/vulnerability-alerts" --silent 2>/dev/null && DEP_EN="enabled" || DEP_EN="disabled"
-          # Code scanning: default-setup state
-          CS_STATE=$(gh api "repos/$R/code-scanning/default-setup" --jq '.state' 2>/dev/null || echo "unknown")
 
-          # ---- Alert sayımları ----
+          # ---- Alert sayımları (code scanning'i CodeQL job'u sağlıyor, burada yok) ----
           gh api --paginate "repos/$R/dependabot/alerts?state=open&per_page=100" > dep.json 2>/dev/null || echo '[]' > dep.json
           [ -s dep.json ] || echo '[]' > dep.json
           DEP_C=$(jq '[.[]?|select(.security_advisory.severity=="critical")]|length' dep.json)
@@ -1040,30 +1128,23 @@ jobs:
           [ -s sec.json ] || echo '[]' > sec.json
           SECRETS=$(jq 'if type=="array" then length else 0 end' sec.json)
 
-          gh api --paginate "repos/$R/code-scanning/alerts?state=open&per_page=100" > cs.json 2>/dev/null || echo '[]' > cs.json
-          [ -s cs.json ] || echo '[]' > cs.json
-          CS_C=$(jq 'if type=="array" then [.[]?|select(.rule.security_severity_level=="critical")]|length else 0 end' cs.json)
-          CS_H=$(jq 'if type=="array" then [.[]?|select(.rule.security_severity_level=="high")]|length else 0 end' cs.json)
-
           # ---- Compliance: enforce isteniyorsa gerekli özellikler açık olmalı ----
           VIOL='[]'
           COMPLIANT=true
           if [ "$ENFORCE" = "true" ]; then
             [ "$SECRET_EN" != "enabled" ] && { VIOL=$(echo "$VIOL" | jq '. + ["secret scanning kapalı"]'); COMPLIANT=false; }
             [ "$DEP_EN" != "enabled" ]    && { VIOL=$(echo "$VIOL" | jq '. + ["Dependabot alerts kapalı"]'); COMPLIANT=false; }
-            [ "$CS_STATE" != "configured" ] && { VIOL=$(echo "$VIOL" | jq '. + ["Code scanning (default setup) configured değil"]'); COMPLIANT=false; }
           fi
 
           jq -n \
             --argjson en "$([ "$ENFORCE" = "true" ] && echo true || echo false)" \
             --argjson comp "$COMPLIANT" \
-            --arg secret_en "$SECRET_EN" --arg dep_en "$DEP_EN" --arg cs_state "$CS_STATE" \
-            --argjson dc "$DEP_C" --argjson dh "$DEP_H" \
-            --argjson cc "$CS_C" --argjson ch "$CS_H" --argjson s "$SECRETS" \
+            --arg secret_en "$SECRET_EN" --arg dep_en "$DEP_EN" \
+            --argjson dc "$DEP_C" --argjson dh "$DEP_H" --argjson s "$SECRETS" \
             --argjson viol "$VIOL" \
             '{available:true, enforced:$en, compliant:$comp,
-              enablement:{secret_scanning:$secret_en, dependabot:$dep_en, code_scanning:$cs_state},
-              findings:{dep_crit:$dc, dep_high:$dh, cs_crit:$cc, cs_high:$ch, secrets:$s},
+              enablement:{secret_scanning:$secret_en, dependabot:$dep_en},
+              findings:{dep_crit:$dc, dep_high:$dh, secrets:$s},
               violations:$viol}' > ghas.json
           cat ghas.json
 
@@ -1078,13 +1159,11 @@ jobs:
             echo "|---|---|"
             echo "| Secret scanning | \`$(jq -r '.enablement.secret_scanning // "?"' ghas.json)\` |"
             echo "| Dependabot      | \`$(jq -r '.enablement.dependabot // "?"' ghas.json)\` |"
-            echo "| Code scanning   | \`$(jq -r '.enablement.code_scanning // "?"' ghas.json)\` |"
             echo "| Compliant       | \`$(jq -r 'if has("compliant") then (.compliant|tostring) else "?" end' ghas.json)\` |"
             echo ""
             echo "| Kaynak | Critical | High |"
             echo "|---|---|---|"
-            echo "| Dependabot    | $(jq -r '.findings.dep_crit // 0' ghas.json) | $(jq -r '.findings.dep_high // 0' ghas.json) |"
-            echo "| Code scanning | $(jq -r '.findings.cs_crit // 0' ghas.json) | $(jq -r '.findings.cs_high // 0' ghas.json) |"
+            echo "| Dependabot      | $(jq -r '.findings.dep_crit // 0' ghas.json) | $(jq -r '.findings.dep_high // 0' ghas.json) |"
             echo "| Secret scanning | $(jq -r '.findings.secrets // 0' ghas.json) | (her secret = RED) |"
             VIOL=$(jq -r '.violations // [] | length' ghas.json)
             if [ "$VIOL" -gt 0 ]; then
@@ -1108,7 +1187,7 @@ jobs:
     name: 🛡️ Verdict (DevOps Response)
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [preflight, secret-scan, sast, sca, container-scan, dast-zap, dast-nuclei, ghas]
+    needs: [preflight, secret-scan, sast, sca, container-scan, dast-zap, dast-nuclei, codeql, ghas]
     if: always() && needs.preflight.result == 'success'
     steps:
       - name: Tüm tarama çıktılarını indir
@@ -1154,14 +1233,12 @@ jobs:
             NUC_M=$(jq '[.[] | select(.info.severity=="medium")]   | length' scans/nuclei.json)
           fi
 
-          # ---- GHAS native (Dependabot + Code scanning + Secret scanning) ----
-          GHAS_DEP_C=0; GHAS_DEP_H=0; GHAS_CS_C=0; GHAS_CS_H=0; GHAS_SECRETS=0
+          # ---- GHAS native (Dependabot + Secret scanning) ----
+          GHAS_DEP_C=0; GHAS_DEP_H=0; GHAS_SECRETS=0
           GHAS_AVAILABLE=true; GHAS_COMPLIANT=true; GHAS_ENFORCED=false; GHAS_VIOL=""
           if [ -f scans/ghas.json ]; then
             GHAS_DEP_C=$(jq '.findings.dep_crit // 0' scans/ghas.json)
             GHAS_DEP_H=$(jq '.findings.dep_high // 0' scans/ghas.json)
-            GHAS_CS_C=$(jq '.findings.cs_crit // 0'  scans/ghas.json)
-            GHAS_CS_H=$(jq '.findings.cs_high // 0'  scans/ghas.json)
             GHAS_SECRETS=$(jq '.findings.secrets // 0' scans/ghas.json)
             # DİKKAT: jq'da `// true` false değerini de true yapar (// false'u boş sayar).
             # Bu yüzden has() ile açıkça oku.
@@ -1171,8 +1248,15 @@ jobs:
             GHAS_VIOL=$(jq -r '.violations // [] | join("; ")' scans/ghas.json)
           fi
 
-          TOTAL_CRIT=$((SCA_C + IMG_C + NUC_C + GHAS_DEP_C + GHAS_CS_C))
-          TOTAL_HIGH=$((SAST_H + SCA_H + IMG_H + ZAP_H + NUC_H + GHAS_DEP_H + GHAS_CS_H))
+          # ---- CodeQL in-pipeline (SARIF parse, deterministik) ----
+          CODEQL_C=0; CODEQL_H=0
+          if [ -f scans/codeql.json ]; then
+            CODEQL_C=$(jq '.crit // 0' scans/codeql.json)
+            CODEQL_H=$(jq '.high // 0' scans/codeql.json)
+          fi
+
+          TOTAL_CRIT=$((SCA_C + IMG_C + NUC_C + GHAS_DEP_C + CODEQL_C))
+          TOTAL_HIGH=$((SAST_H + SCA_H + IMG_H + ZAP_H + NUC_H + GHAS_DEP_H + CODEQL_H))
           SECRETS=$((SECRETS + GHAS_SECRETS))
 
           CTH=${{ inputs.critical_threshold }}
@@ -1247,7 +1331,7 @@ jobs:
             --argjson zap_h $ZAP_H --argjson zap_m $ZAP_M \
             --argjson nuc_c $NUC_C --argjson nuc_h $NUC_H --argjson nuc_m $NUC_M \
             --argjson ghas_dep_c $GHAS_DEP_C --argjson ghas_dep_h $GHAS_DEP_H \
-            --argjson ghas_cs_c $GHAS_CS_C --argjson ghas_cs_h $GHAS_CS_H --argjson ghas_secrets $GHAS_SECRETS \
+            --argjson codeql_c $CODEQL_C --argjson codeql_h $CODEQL_H --argjson ghas_secrets $GHAS_SECRETS \
             --argjson ghas_available "$GHAS_AVAILABLE" --argjson ghas_compliant "$GHAS_COMPLIANT" \
             --argjson ghas_enforced "$GHAS_ENFORCED" --arg ghas_viol "$GHAS_VIOL" \
             --argjson tcrit $TOTAL_CRIT --argjson thigh $TOTAL_HIGH \
@@ -1280,7 +1364,7 @@ jobs:
                 dast_high: $zap_h, dast_medium: $zap_m,
                 nuclei_critical: $nuc_c, nuclei_high: $nuc_h, nuclei_medium: $nuc_m,
                 ghas_dependabot_critical: $ghas_dep_c, ghas_dependabot_high: $ghas_dep_h,
-                ghas_codescan_critical: $ghas_cs_c, ghas_codescan_high: $ghas_cs_h,
+                codeql_critical: $codeql_c, codeql_high: $codeql_h,
                 ghas_secrets: $ghas_secrets,
                 total_critical: $tcrit, total_high: $thigh
               },
